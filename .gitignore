@@ -1,1 +1,4 @@
 .DS_Store
+
+# Object-concept edge CSV files can be large; commit compressed .csv.gz files.
+data/*/*_object_concept_edges.csv
