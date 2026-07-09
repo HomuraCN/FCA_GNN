@@ -1,4 +1,6 @@
 .DS_Store
+__pycache__/
+*.pyc
 
 # Object-concept edge CSV files can be large; commit compressed .csv.gz files.
 data/*/*_object_concept_edges.csv
