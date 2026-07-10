@@ -17,7 +17,7 @@ The Java side expects:
 The Python side reads `/abs/path/to/generated_inputs/{dataset}_input` and writes all runs/results to
 `/abs/path/to/experiment_outputs/{dataset}_output`.
 
-Run all six core results:
+Run all eight core results, including the positive-only bipartite CPE ablation:
 
 ```bash
 conda run -n normal python /Users/didi/code/mix/fca/FCA_GNN/scripts/run_all_experiments.py \
@@ -40,7 +40,7 @@ For datasets where adjacency matrices are too expensive, such as nursery-style l
   --skip-adjacency true
 ```
 
-Then run only the bipartite experiments:
+Then run only the six bipartite experiments:
 
 ```bash
 conda run -n normal python /Users/didi/code/mix/fca/FCA_GNN/scripts/run_all_experiments.py \
@@ -58,5 +58,8 @@ Run one experiment only:
 conda run -n normal python /Users/didi/code/mix/fca/FCA_GNN/scripts/train_12_with_cpe.py --dataset car --input-dir /abs/path/to/generated_inputs/car_input --output-dir /abs/path/to/experiment_outputs
 conda run -n normal python /Users/didi/code/mix/fca/FCA_GNN/scripts/train_12_without_cpe.py --dataset car --input-dir /abs/path/to/generated_inputs/car_input --output-dir /abs/path/to/experiment_outputs
 conda run -n normal python /Users/didi/code/mix/fca/FCA_GNN/scripts/train_14_2_with_cpe.py --dataset car --input-dir /abs/path/to/generated_inputs/car_input --output-dir /abs/path/to/experiment_outputs --topk 8 32
+conda run -n normal python /Users/didi/code/mix/fca/FCA_GNN/scripts/train_14_4_positive_only_with_cpe.py --dataset car --input-dir /abs/path/to/generated_inputs/car_input --output-dir /abs/path/to/experiment_outputs --topk 8 32
 conda run -n normal python /Users/didi/code/mix/fca/FCA_GNN/scripts/train_14_3_without_cpe.py --dataset car --input-dir /abs/path/to/generated_inputs/car_input --output-dir /abs/path/to/experiment_outputs --topk 8 32
 ```
+
+`14_4_bipartite_positive_only_with_cpe` keeps the positive bipartite branch, CPE, Top-K setting, and training configuration from `14_2_bipartite_with_cpe`, while removing the negative branch. Compare the two experiments at the same Top-K value to evaluate the contribution of the dual-branch design.
