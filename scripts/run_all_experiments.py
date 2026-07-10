@@ -10,6 +10,7 @@ from fca_experiment import (
     config_from_args,
     train_adjacency,
     train_bipartite,
+    train_positive_bipartite,
     write_suite_summary,
 )
 
@@ -37,7 +38,7 @@ def main() -> None:
         const=True,
         default=False,
         type=parse_bool,
-        help="Skip adjacency-matrix experiments 12/12_2 and run only bipartite 14_2/14_3.",
+        help="Skip adjacency-matrix experiments 12/12_2 and run only bipartite 14_2/14_4/14_3.",
     )
     args = parser.parse_args()
 
@@ -56,6 +57,11 @@ def main() -> None:
         config = config_from_args(args, experiment="14_2_bipartite_with_cpe", topk=topk)
         config.hidden_channels = args.bipartite_hidden_channels
         results.append(train_bipartite(config, with_cpe=True))
+
+    for topk in args.topk:
+        config = config_from_args(args, experiment="14_4_bipartite_positive_only_with_cpe", topk=topk)
+        config.hidden_channels = args.bipartite_hidden_channels
+        results.append(train_positive_bipartite(config, with_cpe=True))
 
     for topk in args.topk:
         config = config_from_args(args, experiment="14_3_bipartite_without_cpe", topk=topk)

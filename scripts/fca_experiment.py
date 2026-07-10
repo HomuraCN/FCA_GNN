@@ -192,9 +192,13 @@ def make_masks(num_nodes: int, seed: int | None = None) -> tuple[torch.Tensor, t
 
 
 def load_depth_profile_cpe(input_dir: Path, dataset: str, profile_bins: int) -> tuple[torch.Tensor, torch.Tensor]:
-    cpe_pos = load_feature_matrix(input_dir / f"{dataset}_CPE_A_plus_depth_profile{profile_bins}.csv")
+    cpe_pos = load_positive_depth_profile_cpe(input_dir, dataset, profile_bins)
     cpe_neg = load_feature_matrix(input_dir / f"{dataset}_CPE_A_negative_depth_profile{profile_bins}.csv")
     return cpe_pos, cpe_neg
+
+
+def load_positive_depth_profile_cpe(input_dir: Path, dataset: str, profile_bins: int) -> torch.Tensor:
+    return load_feature_matrix(input_dir / f"{dataset}_CPE_A_plus_depth_profile{profile_bins}.csv")
 
 
 def load_adjacency_data(config: TrainConfig, *, with_cpe: bool) -> tuple[Data, int]:
@@ -390,6 +394,47 @@ def load_bipartite_batch(config: TrainConfig, *, with_cpe: bool) -> dict:
     }
 
 
+def load_positive_bipartite_batch(config: TrainConfig, *, with_cpe: bool) -> dict:
+    x_raw = load_feature_matrix(config.input_dir / f"{config.dataset}.data.cleaned.csv")
+    num_objects = x_raw.shape[0]
+    if with_cpe:
+        cpe_pos = load_positive_depth_profile_cpe(config.input_dir, config.dataset, config.cpe_profile_bins)
+        if cpe_pos.shape[0] != num_objects:
+            raise ValueError(f"Positive CPE row count must match object count {num_objects}")
+        x_pos = torch.cat([x_raw, cpe_pos], dim=1)
+    else:
+        x_pos = x_raw
+
+    pos_concept_x = load_feature_matrix(config.input_dir / f"{config.dataset}_positive_object_concept_concept_features.csv")
+    pos_edges = load_bipartite_edges(
+        config.input_dir / f"{config.dataset}_positive_object_concept_edges.csv",
+        num_objects,
+        pos_concept_x.shape[0],
+        config.topk,
+    )
+
+    labels = load_labels(config.input_dir, config.dataset, num_objects)
+    encoder = LabelEncoder()
+    y_numpy = encoder.fit_transform(labels)
+    y = torch.tensor(y_numpy, dtype=torch.long)
+    train_mask, val_mask, test_mask = make_masks(num_objects, config.seed)
+
+    print(f"topK={config.topk}")
+    print(f"object feature dim: {x_raw.shape[1]}")
+    print(f"positive concept nodes: {pos_concept_x.shape[0]}, edges: {pos_edges['kept_edge_count']}/{pos_edges['original_edge_count']}")
+
+    return {
+        "x_pos": x_pos,
+        "pos_concept_x": pos_concept_x,
+        "pos_edges": pos_edges,
+        "y": y,
+        "train_mask": train_mask,
+        "val_mask": val_mask,
+        "test_mask": test_mask,
+        "num_classes": len(np.unique(y_numpy)),
+    }
+
+
 class WeightedBipartiteBranch(nn.Module):
     def __init__(self, object_in_channels: int, concept_in_channels: int, hidden_channels: int, heads: int, dropout: float):
         super().__init__()
@@ -446,6 +491,32 @@ class DualWeightedBipartiteTransformer(nn.Module):
         return self.fusion_layer(torch.cat([pos_h, neg_h], dim=1))
 
 
+class PositiveWeightedBipartiteTransformer(nn.Module):
+    def __init__(
+        self,
+        object_in_channels: int,
+        concept_channels: int,
+        hidden_channels: int,
+        out_channels: int,
+        heads: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.pos_branch = WeightedBipartiteBranch(object_in_channels, concept_channels, hidden_channels, heads, dropout)
+        self.classifier = nn.Linear(hidden_channels, out_channels)
+
+    def forward(self, batch: dict) -> torch.Tensor:
+        pos_h = self.pos_branch(
+            batch["x_pos"],
+            batch["pos_concept_x"],
+            batch["pos_edges"]["obj_to_concept"],
+            batch["pos_edges"]["concept_to_obj"],
+            batch["pos_edges"]["edge_attr"],
+            batch["pos_edges"]["rev_edge_attr"],
+        )
+        return self.classifier(pos_h)
+
+
 def train_bipartite(config: TrainConfig, *, with_cpe: bool) -> TrainResult:
     set_seed(config.seed)
     batch = load_bipartite_batch(config, with_cpe=with_cpe)
@@ -454,6 +525,32 @@ def train_bipartite(config: TrainConfig, *, with_cpe: bool) -> TrainResult:
         neg_object_in_channels=batch["x_neg"].shape[1],
         pos_concept_channels=batch["pos_concept_x"].shape[1],
         neg_concept_channels=batch["neg_concept_x"].shape[1],
+        hidden_channels=config.hidden_channels,
+        out_channels=batch["num_classes"],
+        heads=config.heads,
+        dropout=config.dropout,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+    criterion = torch.nn.CrossEntropyLoss()
+    return run_training_loop(
+        config,
+        model,
+        optimizer,
+        criterion,
+        forward_fn=lambda: model(batch),
+        y=batch["y"],
+        train_mask=batch["train_mask"],
+        val_mask=batch["val_mask"],
+        test_mask=batch["test_mask"],
+    )
+
+
+def train_positive_bipartite(config: TrainConfig, *, with_cpe: bool) -> TrainResult:
+    set_seed(config.seed)
+    batch = load_positive_bipartite_batch(config, with_cpe=with_cpe)
+    model = PositiveWeightedBipartiteTransformer(
+        object_in_channels=batch["x_pos"].shape[1],
+        concept_channels=batch["pos_concept_x"].shape[1],
         hidden_channels=config.hidden_channels,
         out_channels=batch["num_classes"],
         heads=config.heads,
