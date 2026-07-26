@@ -13,6 +13,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import f1_score
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.tensorboard import SummaryWriter
 from torch_geometric.data import Data
@@ -38,6 +39,8 @@ class TrainConfig:
     threshold_pos: float = 128.0
     threshold_neg: float = 5000.0
     topk: int | None = None
+    edge_tiebreak: str = "intent"
+    class_weights: str = "none"
 
 
 @dataclass
@@ -45,11 +48,15 @@ class TrainResult:
     dataset: str
     experiment: str
     topk: int | None
+    seed: int
     final_train_acc: float
     final_val_acc: float
     final_test_acc: float
+    final_test_macro_f1: float
     best_val_acc: float
     best_val_epoch: int
+    test_acc_at_best_val: float
+    test_macro_f1_at_best_val: float
     best_test_acc: float
     best_test_epoch: int
     log_dir: str
@@ -77,6 +84,12 @@ def add_common_args(parser: argparse.ArgumentParser, *, default_experiment: str)
     parser.add_argument("--dropout", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-every", type=int, default=1)
+    parser.add_argument(
+        "--class-weights",
+        choices=["none", "balanced"],
+        default="none",
+        help="Loss class weighting: balanced uses inverse train-split class frequency (for imbalanced datasets such as solar_flare_m).",
+    )
 
 
 def add_cpe_args(parser: argparse.ArgumentParser) -> None:
@@ -95,6 +108,18 @@ def add_topk_args(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=[8, 32],
         help="Run one or more per-object membership topK values.",
+    )
+    parser.add_argument(
+        "--edge-tiebreak",
+        choices=["intent", "keep-ties", "legacy"],
+        default="intent",
+        help=(
+            "How to break weight ties in per-object topK edge selection: "
+            "intent prefers concepts with larger intents (more specific; on fully-factorial data "
+            "it degenerates to legacy because equal support implies equal intent size); "
+            "keep-ties keeps every edge tied with the K-th weight (at-least-K semantics, no arbitration); "
+            "legacy keeps the old concept_id order for comparison."
+        ),
     )
 
 
@@ -116,6 +141,8 @@ def config_from_args(args: argparse.Namespace, *, experiment: str, topk: int | N
         threshold_pos=getattr(args, "threshold_pos", 128.0),
         threshold_neg=getattr(args, "threshold_neg", 5000.0),
         topk=topk,
+        edge_tiebreak=getattr(args, "edge_tiebreak", "intent"),
+        class_weights=getattr(args, "class_weights", "none"),
     )
 
 
@@ -281,7 +308,7 @@ def train_adjacency(config: TrainConfig, *, with_cpe: bool) -> TrainResult:
         dropout=config.dropout,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = make_criterion(config, data.y, data.train_mask, num_classes)
     return run_training_loop(
         config,
         model,
@@ -295,9 +322,40 @@ def train_adjacency(config: TrainConfig, *, with_cpe: bool) -> TrainResult:
     )
 
 
-def keep_topk_memberships_per_object(df: pd.DataFrame, topk: int | None) -> pd.DataFrame:
+def keep_topk_memberships_per_object(
+    df: pd.DataFrame,
+    topk: int | None,
+    concept_intent_sizes: np.ndarray | None = None,
+    tiebreak: str = "intent",
+) -> pd.DataFrame:
     if topk is None or topk <= 0 or len(df) == 0:
         return df
+    if tiebreak == "keep-ties":
+        # 每对象以第 K 大 weight 为门槛，边界并列全保留（“至少 K 条”），
+        # 完全不依赖 concept_id / 生成顺序仲裁。完全析因数据（如 car）上同支撑度
+        # 概念的内涵基数也相同，intent 次级键无区分度，此模式是唯一消除仲裁的选择。
+        df_sorted = df.sort_values(["object_id", "weight", "concept_id"], ascending=[True, False, True])
+        rank_in_object = df_sorted.groupby("object_id").cumcount()
+        kth_weight = df_sorted[rank_in_object == topk - 1][["object_id", "weight"]].rename(
+            columns={"weight": "_kth_weight"}
+        )
+        merged = df_sorted.merge(kth_weight, on="object_id", how="left")
+        kept = merged[merged["_kth_weight"].isna() | (merged["weight"] >= merged["_kth_weight"])]
+        return kept.drop(columns="_kth_weight").reset_index(drop=True)
+    if tiebreak == "intent" and concept_intent_sizes is not None:
+        # weight 由概念支撑度唯一决定，取值高度离散，K 边界处大量并列；
+        # 并列时优先保留内涵更大（约束更多、更具体）的概念，concept_id 仅作最终确定性兜底。
+        df = df.assign(intent_size=concept_intent_sizes[df["concept_id"].to_numpy()])
+        return (
+            df.sort_values(
+                ["object_id", "weight", "intent_size", "concept_id"],
+                ascending=[True, False, False, True],
+            )
+            .groupby("object_id", group_keys=False)
+            .head(topk)
+            .drop(columns="intent_size")
+            .reset_index(drop=True)
+        )
     return (
         df.sort_values(["object_id", "weight", "concept_id"], ascending=[True, False, True])
         .groupby("object_id", group_keys=False)
@@ -306,7 +364,14 @@ def keep_topk_memberships_per_object(df: pd.DataFrame, topk: int | None) -> pd.D
     )
 
 
-def load_bipartite_edges(path: Path, object_count: int, concept_count: int, topk_per_object: int | None) -> dict:
+def load_bipartite_edges(
+    path: Path,
+    object_count: int,
+    concept_count: int,
+    topk_per_object: int | None,
+    concept_intent_sizes: np.ndarray | None = None,
+    tiebreak: str = "intent",
+) -> dict:
     if path.exists():
         df = pd.read_csv(path)
     elif Path(str(path) + ".gz").exists():
@@ -319,7 +384,7 @@ def load_bipartite_edges(path: Path, object_count: int, concept_count: int, topk
         raise ValueError(f"Edge table must contain columns {required_columns}: {path}")
 
     original_edge_count = len(df)
-    df = keep_topk_memberships_per_object(df, topk_per_object)
+    df = keep_topk_memberships_per_object(df, topk_per_object, concept_intent_sizes, tiebreak)
     object_ids = torch.tensor(df["object_id"].to_numpy(), dtype=torch.long)
     concept_ids = torch.tensor(df["concept_id"].to_numpy(), dtype=torch.long)
     weights = torch.tensor(df["weight"].to_numpy(), dtype=torch.float).view(-1, 1)
@@ -355,17 +420,22 @@ def load_bipartite_batch(config: TrainConfig, *, with_cpe: bool) -> dict:
 
     pos_concept_x = load_feature_matrix(config.input_dir / f"{config.dataset}_positive_object_concept_concept_features.csv")
     neg_concept_x = load_feature_matrix(config.input_dir / f"{config.dataset}_negative_object_concept_concept_features.csv")
+    # 概念特征行号即 concept_id，倒数第 2 列为归一化内涵基数，作为 topK 并列时的语义次级键
     pos_edges = load_bipartite_edges(
         config.input_dir / f"{config.dataset}_positive_object_concept_edges.csv",
         num_objects,
         pos_concept_x.shape[0],
         config.topk,
+        concept_intent_sizes=pos_concept_x[:, -2].numpy(),
+        tiebreak=config.edge_tiebreak,
     )
     neg_edges = load_bipartite_edges(
         config.input_dir / f"{config.dataset}_negative_object_concept_edges.csv",
         num_objects,
         neg_concept_x.shape[0],
         config.topk,
+        concept_intent_sizes=neg_concept_x[:, -2].numpy(),
+        tiebreak=config.edge_tiebreak,
     )
 
     labels = load_labels(config.input_dir, config.dataset, num_objects)
@@ -411,6 +481,8 @@ def load_positive_bipartite_batch(config: TrainConfig, *, with_cpe: bool) -> dic
         num_objects,
         pos_concept_x.shape[0],
         config.topk,
+        concept_intent_sizes=pos_concept_x[:, -2].numpy(),
+        tiebreak=config.edge_tiebreak,
     )
 
     labels = load_labels(config.input_dir, config.dataset, num_objects)
@@ -531,7 +603,7 @@ def train_bipartite(config: TrainConfig, *, with_cpe: bool) -> TrainResult:
         dropout=config.dropout,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = make_criterion(config, batch["y"], batch["train_mask"], batch["num_classes"])
     return run_training_loop(
         config,
         model,
@@ -557,7 +629,7 @@ def train_positive_bipartite(config: TrainConfig, *, with_cpe: bool) -> TrainRes
         dropout=config.dropout,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = make_criterion(config, batch["y"], batch["train_mask"], batch["num_classes"])
     return run_training_loop(
         config,
         model,
@@ -573,6 +645,23 @@ def train_positive_bipartite(config: TrainConfig, *, with_cpe: bool) -> TrainRes
 
 def accuracy(pred: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> float:
     return (pred[mask] == y[mask]).sum().item() / mask.sum().item()
+
+
+def macro_f1(pred: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> float:
+    return float(f1_score(y[mask].cpu().numpy(), pred[mask].cpu().numpy(), average="macro", zero_division=0))
+
+
+def make_criterion(config: TrainConfig, y: torch.Tensor, train_mask: torch.Tensor, num_classes: int) -> nn.Module:
+    if config.class_weights == "balanced":
+        # 仅用训练划分的类频率，权重 = n_train / (num_classes * count)，训练集缺失的类权重为 0
+        counts = torch.bincount(y[train_mask], minlength=num_classes).float()
+        weights = torch.where(
+            counts > 0,
+            train_mask.sum().float() / (num_classes * counts),
+            torch.zeros_like(counts),
+        )
+        return torch.nn.CrossEntropyLoss(weight=weights)
+    return torch.nn.CrossEntropyLoss()
 
 
 def run_training_loop(
@@ -592,14 +681,19 @@ def run_training_loop(
     epoch_metrics_path = run_dir / "epoch_metrics.csv"
     best_val = (-1.0, 0)
     best_test = (-1.0, 0)
+    test_at_best_val = (0.0, 0.0)
     final_train_acc = final_val_acc = final_test_acc = 0.0
+    final_val_macro_f1 = final_test_macro_f1 = 0.0
 
     print(f"TensorBoard log dir: {run_dir}")
     print(f"Start training: {config.experiment}, epochs={config.epochs}")
 
     try:
         with epoch_metrics_path.open("w", newline="", encoding="utf-8") as f:
-            metrics_writer = csv.DictWriter(f, fieldnames=["epoch", "loss", "train_acc", "val_acc", "test_acc"])
+            metrics_writer = csv.DictWriter(
+                f,
+                fieldnames=["epoch", "loss", "train_acc", "val_acc", "test_acc", "val_macro_f1", "test_macro_f1"],
+            )
             metrics_writer.writeheader()
 
             for epoch in range(1, config.epochs + 1):
@@ -618,10 +712,14 @@ def run_training_loop(
                     final_train_acc = accuracy(pred, y, train_mask)
                     final_val_acc = accuracy(pred, y, val_mask)
                     final_test_acc = accuracy(pred, y, test_mask)
+                    final_val_macro_f1 = macro_f1(pred, y, val_mask)
+                    final_test_macro_f1 = macro_f1(pred, y, test_mask)
 
                 writer.add_scalar("Accuracy/train", final_train_acc, epoch)
                 writer.add_scalar("Accuracy/validation", final_val_acc, epoch)
                 writer.add_scalar("Accuracy/test", final_test_acc, epoch)
+                writer.add_scalar("MacroF1/validation", final_val_macro_f1, epoch)
+                writer.add_scalar("MacroF1/test", final_test_macro_f1, epoch)
                 metrics_writer.writerow(
                     {
                         "epoch": epoch,
@@ -629,11 +727,14 @@ def run_training_loop(
                         "train_acc": final_train_acc,
                         "val_acc": final_val_acc,
                         "test_acc": final_test_acc,
+                        "val_macro_f1": final_val_macro_f1,
+                        "test_macro_f1": final_test_macro_f1,
                     }
                 )
 
                 if final_val_acc > best_val[0]:
                     best_val = (final_val_acc, epoch)
+                    test_at_best_val = (final_test_acc, final_test_macro_f1)
                 if final_test_acc > best_test[0]:
                     best_test = (final_test_acc, epoch)
                 if epoch % config.log_every == 0 or epoch == 1 or epoch == config.epochs:
@@ -648,11 +749,15 @@ def run_training_loop(
             dataset=config.dataset,
             experiment=config.experiment,
             topk=config.topk,
+            seed=config.seed,
             final_train_acc=final_train_acc,
             final_val_acc=final_val_acc,
             final_test_acc=final_test_acc,
+            final_test_macro_f1=final_test_macro_f1,
             best_val_acc=best_val[0],
             best_val_epoch=best_val[1],
+            test_acc_at_best_val=test_at_best_val[0],
+            test_macro_f1_at_best_val=test_at_best_val[1],
             best_test_acc=best_test[0],
             best_test_epoch=best_test[1],
             log_dir=str(run_dir),
@@ -673,15 +778,27 @@ def run_training_loop(
                 "accuracy/final_test": final_test_acc,
             },
         )
-        print(f"Finished {config.experiment}: final_test={final_test_acc:.4f}, best_test={best_test[0]:.4f}@{best_test[1]}")
+        print(
+            f"Finished {config.experiment}: final_test={final_test_acc:.4f}, "
+            f"final_test_macro_f1={final_test_macro_f1:.4f}, "
+            f"test@best_val={test_at_best_val[0]:.4f}@{best_val[1]}, "
+            f"best_test={best_test[0]:.4f}@{best_test[1]}"
+        )
         return result
     finally:
         writer.close()
 
 
 def append_summary(config: TrainConfig, result: TrainResult) -> None:
-    summary_path = experiment_root(config) / "results" / "summary.csv"
     row = asdict(result)
+    results_root = experiment_root(config) / "results"
+    summary_path = results_root / "summary.csv"
+    if summary_path.exists():
+        with summary_path.open("r", newline="", encoding="utf-8") as f:
+            existing_fields = next(csv.reader(f), [])
+        if existing_fields != list(row.keys()):
+            # 旧结果目录的 summary.csv 列结构不同（历史基线），不追加破坏它，改写 v2 文件
+            summary_path = results_root / "summary_v2.csv"
     exists = summary_path.exists()
     with summary_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
